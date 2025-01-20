@@ -3,9 +3,134 @@ from bpy.types import Node, NodeTree
 from bpy.props import StringProperty, PointerProperty
 from bpy.types import Operator
 
-from transforms import transform_single_png, scale_transform_sample
-from feedforward import single_pass
 import torch
+
+import cv2
+import cv2.ximgproc as xip
+import numpy as np
+
+from torchvision import transforms
+from PIL import Image
+
+import pickle
+import os
+
+img_transform = transforms.Compose([transforms.PILToTensor()])
+ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def single_pass(model, input_tensor, guide_tensor, device, dataset_info, output_path):
+
+    with open(dataset_info, 'rb') as f:
+        values = pickle.load(f)
+
+    dataset_mean = values[0]
+    dataset_std = values[1]
+
+    model = model.to(device)
+    input_tensor = input_tensor.to(device)
+
+    result = model(input_tensor)
+
+    result = result.detach()
+    result = result.to(torch.device("cpu"))
+    result = unnormalize_tensor(result, dataset_mean, dataset_std)
+
+    result = result.detach().numpy()
+    result = result.squeeze(0)
+
+    guide_tensor = guide_tensor.detach().numpy()
+
+    if guide_tensor.shape[0] == 4:
+        guide_tensor = guide_tensor[:3, :, :]
+
+    result = joint_bilateral_up_sample(result, guide_tensor, save_img=True, output_path=output_path)
+
+    return result
+
+#Returns an image's corresponding tensor
+def transform_single_png(sample):
+    img = img_transform(Image.open(sample))
+    dim = min(img.shape[1], img.shape[2])
+    square_transform = transforms.Compose([transforms.Resize((dim, dim))])
+    return square_transform(img)
+
+def scale_transform_sample(datapoint, standalone=False):
+
+    #Standalone is true if the function is called on a single image rather than as a part of a dataset
+    if standalone:
+        datapoint = datapoint.float() / 255
+
+    #Intial Size transform (256, 256) in order to save on processing, images get upscaled later
+    transform1 = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((256,256)),
+        transforms.ToTensor(),
+    ])
+
+    #Removes alpha channel if image has one
+    if datapoint.shape[0] == 4:
+        datapoint = datapoint[:3, :, :]
+
+    #Size transform
+    datapoint = transform1(datapoint)
+
+    #Add batch dimension if single sample doesen't have it
+    if standalone and len(datapoint.shape) == 3:
+        datapoint = datapoint.unsqueeze(0)
+
+    return datapoint
+
+def normalize_sample(datapoint, mean, std):
+
+    normal_transform = transforms.Compose([
+        transforms.Normalize(mean=mean, std=std)
+    ])
+
+    return normal_transform(datapoint)
+
+def normalize_data(dataset):
+
+    mean = 0.0
+    std = 0.0
+
+    for datapoint in dataset:
+        datapoint[0] = datapoint[0].float() / 255
+        datapoint[1] = datapoint[1].float() / 255
+        mean += datapoint[0].mean() + datapoint[1].mean()
+        std += datapoint[0].std() + datapoint[1].std()
+
+    mean /= len(dataset)*2
+    std /= len(dataset)*2
+
+    normalized_dataset = []
+
+    for datapoint in dataset:
+        scaled_datapoints = [scale_transform_sample(datapoint[0]), scale_transform_sample(datapoint[1])]
+        normalized_dataset.append([normalize_sample(scaled_datapoints[0], mean, std), normalize_sample(scaled_datapoints[1], mean, std)])
+
+    return normalized_dataset, mean, std
+
+def unnormalize_tensor(sample, mean, std):
+    return sample * std + mean
+
+def joint_bilateral_up_sample(low_res, guide, d=5, sigma_color=0.1, sigma_space=2.0, save_img=False, output_path=""):
+
+    low_res = np.transpose(low_res, (1,2,0))
+    guide = np.transpose(guide, (1,2,0))
+    guide = np.float32(guide)
+
+    new_width = guide.shape[0]
+    new_height = guide.shape[1]
+
+    up_scaled_f = cv2.resize(low_res, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+    filtered_f = xip.jointBilateralFilter(guide, up_scaled_f, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    out = np.clip(filtered_f * 255.0, 0, 255).astype(np.uint8)
+
+    if save_img:
+        cv2.imwrite(output_path, out)
+
+    return out
 
 # Optional: custom socket types, but you can also use built-in ones.
 class PBRGeneratorSocket(bpy.types.NodeSocket):
@@ -25,7 +150,7 @@ class PBRGeneratorSocket(bpy.types.NodeSocket):
         layout.prop(self, "default_value", text=text)
 
     def draw_color(self, context, node):
-        return (0.8, 0.4, 0.4, 1.0)  # RGBA color for the socket icon
+        return (0.2, 0.1, 0.9, 1.0)  # RGBA color for the socket icon
 
 
 class PBRGeneratorNode(Node):
@@ -34,17 +159,14 @@ class PBRGeneratorNode(Node):
     bl_label = "PBR Generator"
     bl_icon = 'NODE_TEXTURE'
 
-    # Properties for your node, e.g. a path to the model, or a "Generate" button
-    model_path: StringProperty(
-        name="Model Path",
-        default="//pbr_model.pt",
-        description="Path to your generative model"
+    image_path: StringProperty(
+        name="Image Path",
+        subtype='FILE_PATH',  # So Blender shows a file browser
+        default="",
+        description="File path to the input image"
     )
 
     def init(self, context):
-        # INPUTS:
-        # For the diffuse image, we can use Blender's built-in image socket
-        self.inputs.new("NodeSocketColor", "Diffuse Image")
 
         # OUTPUTS:
         # Albedo
@@ -61,7 +183,7 @@ class PBRGeneratorNode(Node):
         self.outputs.new("NodeSocketFloat", "Displacement")
 
     def draw_buttons(self, context, layout):
-        layout.prop(self, "model_path", text="Model")
+        layout.prop(self, "image_path", text="Image")
         layout.operator("node.generate_pbr_maps", text="Generate")
 
     def draw_label(self):
@@ -71,27 +193,27 @@ class PBRGeneratorNode(Node):
 
         albedo = transform_single_png(diffuse_image)
         down_sample = scale_transform_sample(albedo, standalone=True)
+        print(ADDON_DIR + "/Models/AOGenerator.pt")
+        AOGenerator = torch.load(ADDON_DIR + "/Models/AOGenerator.pt")
+        DisplacementGenerator = torch.load(ADDON_DIR + "/Models/DisplacementGenerator.pt")
+        MetalnessGenerator = torch.load(ADDON_DIR + "/Models/MetalnessGenerator.pt")
+        NormalGenerator = torch.load(ADDON_DIR + "/Models/NormalGLGenerator.pt")
+        RoughnessGenerator = torch.load(ADDON_DIR + "/Models/RoughnessGenerator.pt")
 
-        AOGenerator = torch.load("Models/AOGenerator.pt")
-        DisplacementGenerator = torch.load("Models/DisplacementGenerator.pt")
-        MetalnessGenerator = torch.load("Models/MetalnessGenerator.pt")
-        NormalGenerator = torch.load("Models/NormalGLGenerator.pt")
-        RoughnessGenerator = torch.load("Models/RoughnessGenerator.pt.pt")
-
-        AODatasetInfo = "ModelInfo/AODatasetInfo.pt"
-        DisplacementDatasetInfo = "ModelInfo/DisplacementDatasetInfo.pt"
-        NormalDatasetInfo = "ModelInfo/NormalDatasetInfo.pt"
-        RoughnessDatasetInfo = "ModelInfo/RoughnessDatasetInfo.pt"
-        MetalnessDatasetInfo = "ModelInfo/MetalnessDatasetInfo.pt"
+        AODatasetInfo = ADDON_DIR + "/ModelInfo/AODatasetInfo.pt"
+        DisplacementDatasetInfo = ADDON_DIR + "/ModelInfo/DisplacementDatasetInfo.pt"
+        NormalDatasetInfo = ADDON_DIR + "/ModelInfo/NormalDatasetInfo.pt"
+        RoughnessDatasetInfo = ADDON_DIR + "/ModelInfo/RoughnessDatasetInfo.pt"
+        MetalnessDatasetInfo = ADDON_DIR + "/ModelInfo/MetalnessDatasetInfo.pt"
 
         device = "gpu" if torch.cuda.is_available() else "cpu"
 
         # For now, we'll just return placeholder data
         albedo_data = albedo
-        roughness_data = single_pass(RoughnessGenerator, down_sample, albedo, device, RoughnessDatasetInfo)
-        normal_data = single_pass(NormalGenerator, down_sample, albedo, device, RoughnessDatasetInfo)
-        metallic_data = single_pass(MetalnessGenerator, down_sample, albedo, device, RoughnessDatasetInfo)
-        ambient_occlusion_data = single_pass(AOGenerator, down_sample, albedo, device, RoughnessDatasetInfo)
+        roughness_data = single_pass(RoughnessGenerator, down_sample, albedo, device, RoughnessDatasetInfo, output_path="Roughness.png")
+        normal_data = single_pass(NormalGenerator, down_sample, albedo, device, RoughnessDatasetInfo, output_path="Normal.png")
+        metallic_data = single_pass(MetalnessGenerator, down_sample, albedo, device, RoughnessDatasetInfo, output_path="Metallic.png")
+        ambient_occlusion_data = single_pass(AOGenerator, down_sample, albedo, device, RoughnessDatasetInfo, output_path="AO.png")
 
         return albedo_data, roughness_data, normal_data, metallic_data, ambient_occlusion_data
 
@@ -107,31 +229,21 @@ class PBRGeneratorOperator(Operator):
             self.report({'ERROR'}, "Active node is not a PBR Generator node.")
             return {'CANCELLED'}
 
-        # Access the input image
-        diffuse_input = node.inputs.get("Diffuse Image")
-        if not diffuse_input or not diffuse_input.is_linked:
-            self.report({'ERROR'}, "No diffuse image linked to the node.")
-            return {'CANCELLED'}
-
-        # The actual image node
-        from_node = diffuse_input.links[0].from_node
-        # If from_node is an Image Texture node, we can grab its image
-        if from_node and from_node.type == 'TEX_IMAGE':
-            diffuse_image = from_node.image
-        else:
-            self.report({'ERROR'}, "Input is not an image.")
+        image_path = node.image_path
+        if not image_path:
+            self.report({'ERROR'}, "No image path specified.")
             return {'CANCELLED'}
 
         # RUN THE MODEL:
-        albedo_data, roughness_data, normal_data, metallic_data, ao_data = node.process_image(diffuse_image)
+        albedo_data, roughness_data, normal_data, metallic_data, ao_data = node.process_image(image_path)
 
         # For demonstration, let's just send placeholders to the sockets
         # (In practice, you'd need a more robust approach, either linking them to new Image Nodes or using custom properties.)
-        node.outputs["Albedo"].default_value = albedo_data
-        node.outputs["Roughness"].default_value = roughness_data
-        node.outputs["Normal"].default_value = normal_data
-        node.outputs["Metallic"].default_value = metallic_data
-        node.outputs["Ambient Occlusion"].default_value = ao_data
+        node.outputs["Albedo"].default_value = albedo_data.cpu().numpy()
+        node.outputs["Roughness"].default_value = roughness_data.cpu().numpy()
+        node.outputs["Normal"].default_value = normal_data.cpu().numpy()
+        node.outputs["Metallic"].default_value = metallic_data.cpu().numpy()
+        node.outputs["Ambient Occlusion"].default_value = ao_data.cpu().numpy()
 
         self.report({'INFO'}, "PBR Maps generated successfully.")
         return {'FINISHED'}

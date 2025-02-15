@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PBR Generator Node",
     "author": "soheilchavo",
-    "version": (1, 0, 9),
+    "version": (1, 0, 3, 7),
     "blender": (3, 0, 0),
     "location": "Shader Editor > Add > Group > PBR Generator",
     "description": "Generates PBR textures from a diffuse image using a generative model.",

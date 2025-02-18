@@ -4,142 +4,13 @@ from bpy.props import StringProperty, PointerProperty
 from bpy.types import Operator
 
 import torch
-
-import cv2
-import cv2.ximgproc as xip
 import numpy as np
-
-from torchvision import transforms
-from PIL import Image
-
-import pickle
 import os
 
-from torch import nn
+from TensorFunctions import transform_single_png, scale_transform_sample
+from Models import single_pass, UNet
 
-img_transform = transforms.Compose([transforms.PILToTensor()])
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def single_pass(model, input_tensor, guide_tensor, device, dataset_info, output_path):
-    with open(dataset_info, 'rb') as f:
-        values = pickle.load(f)
-
-    dataset_mean = values[0]
-    dataset_std = values[1]
-
-    model = model.to(device)
-    input_tensor = input_tensor.to(device)
-
-    result = model(input_tensor)
-
-    result = result.detach()
-    result = result.to(torch.device("cpu"))
-    result = unnormalize_tensor(result, dataset_mean, dataset_std)
-
-    result = result.detach().numpy()
-    result = result.squeeze(0)
-
-    guide_tensor = guide_tensor.detach().numpy()
-
-    if guide_tensor.shape[0] == 4:
-        guide_tensor = guide_tensor[:3, :, :]
-
-    if result[0].mean() > 1:
-        result /= 255
-        
-    result = joint_bilateral_up_sample(result, guide_tensor, save_img=True, output_path=output_path)
-
-    return result
-
-
-# Returns an image's corresponding tensor
-def transform_single_png(sample):
-    img = img_transform(Image.open(sample))
-    dim = min(img.shape[1], img.shape[2])
-    square_transform = transforms.Compose([transforms.Resize((dim, dim))])
-    return square_transform(img)
-
-
-def scale_transform_sample(datapoint, standalone=False):
-    # Standalone is true if the function is called on a single image rather than as a part of a dataset
-    if standalone:
-        datapoint = datapoint.float() / 255
-
-    # Intial Size transform (256, 256) in order to save on processing, images get upscaled later
-    transform1 = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-    ])
-
-    # Removes alpha channel if image has one
-    if datapoint.shape[0] == 4:
-        datapoint = datapoint[:3, :, :]
-
-    # Size transform
-    datapoint = transform1(datapoint)
-
-    # Add batch dimension if single sample doesen't have it
-    if standalone and len(datapoint.shape) == 3:
-        datapoint = datapoint.unsqueeze(0)
-
-    return datapoint
-
-
-def normalize_sample(datapoint, mean, std):
-    normal_transform = transforms.Compose([
-        transforms.Normalize(mean=mean, std=std)
-    ])
-
-    return normal_transform(datapoint)
-
-
-def normalize_data(dataset):
-    mean = 0.0
-    std = 0.0
-
-    for datapoint in dataset:
-        datapoint[0] = datapoint[0].float() / 255
-        datapoint[1] = datapoint[1].float() / 255
-        mean += datapoint[0].mean() + datapoint[1].mean()
-        std += datapoint[0].std() + datapoint[1].std()
-
-    mean /= len(dataset) * 2
-    std /= len(dataset) * 2
-
-    normalized_dataset = []
-
-    for datapoint in dataset:
-        scaled_datapoints = [scale_transform_sample(datapoint[0]), scale_transform_sample(datapoint[1])]
-        normalized_dataset.append(
-            [normalize_sample(scaled_datapoints[0], mean, std), normalize_sample(scaled_datapoints[1], mean, std)])
-
-    return normalized_dataset, mean, std
-
-
-def unnormalize_tensor(sample, mean, std):
-    return sample * std + mean
-
-
-def joint_bilateral_up_sample(low_res, guide, d=5, sigma_color=0.1, sigma_space=2.0, save_img=False, output_path=""):
-    low_res = np.transpose(low_res, (1, 2, 0))
-    guide = np.transpose(guide, (1, 2, 0))
-    guide = np.float32(guide)
-
-    new_width = guide.shape[0]
-    new_height = guide.shape[1]
-
-    up_scaled_f = cv2.resize(low_res, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-
-    filtered_f = xip.jointBilateralFilter(guide, up_scaled_f, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
-    out = np.clip(filtered_f * 255.0, 0, 255).astype(np.uint8)
-
-    if save_img:
-        cv2.imwrite(output_path, out)
-
-    return out
-
 
 def create_image_from_ndarray(name, arr):
     if hasattr(arr, "cpu"):
@@ -151,11 +22,6 @@ def create_image_from_ndarray(name, arr):
 
     if arr.shape[0] == 4 or arr.shape[0] == 3:
         arr = np.transpose(arr, (1, 2, 0))
-
-    with open("log.txt", "a") as f:
-        string_tensor = ','.join(str(val) for val in arr.shape)
-        f.write(string_tensor)
-        f.write('\n')
 
     height = arr.shape[0]
     width = arr.shape[1]
@@ -173,7 +39,6 @@ def create_image_from_ndarray(name, arr):
     image.pixels = flat_data
 
     return image
-
 
 def create_image_texture_node(node_tree, image, node_name="Generated Texture"):
     tex_node = node_tree.nodes.new('ShaderNodeTexImage')
@@ -471,76 +336,6 @@ class PBRGeneratorOperator(Operator):
 
         self.report({'INFO'}, "PBR Maps generated successfully.")
         return {'FINISHED'}
-
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU()
-        )
-
-    def forward(self, x):
-        x2 = self.conv(x)
-        return x2
-
-
-class DownConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DownConv, self).__init__()
-        self.conv = nn.Sequential(
-            DoubleConv(in_channels, out_channels),
-            nn.MaxPool2d(2, 2)
-        )
-
-    def forward(self, x):
-        x2 = self.conv(x)
-        return x2
-
-
-class UpConv(torch.nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(UpConv, self).__init__()
-        self.transpose_conv = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.double_conv = DoubleConv(out_channels * 2, out_channels)
-
-    def forward(self, x, y):
-        x2 = self.transpose_conv(x)
-        x3 = torch.cat([x2, y], dim=1)
-        out = self.double_conv(x3)
-        return out
-
-
-# Simplified U-Net structure (in order to save on training time)
-class UNet(torch.nn.Module):
-    def __init__(self, n_channels):
-        super(UNet, self).__init__()
-        self.n_channels = n_channels
-
-        self.initial_conv = DoubleConv(n_channels, 64)
-        self.down1 = DownConv(64, 128)
-        self.down2 = DownConv(128, 256)
-
-        self.up1 = UpConv(256, 128)
-        self.up2 = UpConv(128, 64)
-        self.final_conv = nn.Conv2d(64, n_channels, kernel_size=1)
-
-    def forward(self, x):
-        x1 = self.initial_conv(x)
-
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-
-        x4 = self.up1(x3, x2)
-        x6 = self.up2(x4, x1)
-
-        x7 = self.final_conv(x6)
-        return x7
 
 
 classes = (

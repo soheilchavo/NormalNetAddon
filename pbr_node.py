@@ -3,29 +3,231 @@ from bpy.types import Node, NodeTree
 from bpy.props import StringProperty, PointerProperty
 from bpy.types import Operator
 
-import torch
 import numpy as np
 import os
 
-from TensorFunctions import transform_single_png, scale_transform_sample
-from Models import single_pass, UNet
+import torch.nn as nn
+import torch
 
+import cv2
+import cv2.ximgproc as xip
+
+from PIL import Image
+from torchvision import transforms
+
+import pickle
+
+img_transform = transforms.Compose([transforms.PILToTensor()])
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
 
+#UpConv for UNet
+class UpConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UpConv, self).__init__()
+        self.transpose_conv = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.double_conv = DoubleConv(out_channels * 2, out_channels)
+
+    def forward(self, x, y):
+        x2 = self.transpose_conv(x)
+        x3 = torch.cat([x2, y], dim=1)
+        out = self.double_conv(x3)
+        return out
+
+
+# Simplified U-Net structure (in order to save on training time)
+class UNet(torch.nn.Module):
+    def __init__(self, n_channels):
+        super(UNet, self).__init__()
+        self.n_channels = n_channels
+
+        self.initial_conv = DoubleConv(n_channels, 64)
+        self.down1 = DownConv(64, 128)
+        self.down2 = DownConv(128, 256)
+
+        self.up1 = UpConv(256, 128)
+        self.up2 = UpConv(128, 64)
+        self.final_conv = nn.Conv2d(64, n_channels, kernel_size=1)
+
+    def forward(self, x):
+        x1 = self.initial_conv(x)
+
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+
+        x4 = self.up1(x3, x2)
+        x6 = self.up2(x4, x1)
+
+        x7 = self.final_conv(x6)
+        return x7
+
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        x2 = self.conv(x)
+        return x2
+
+#DownConv for UNet
+class DownConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DownConv, self).__init__()
+        self.conv = nn.Sequential(
+            DoubleConv(in_channels, out_channels),
+            nn.MaxPool2d(2, 2)
+        )
+
+    def forward(self, x):
+        x2 = self.conv(x)
+        return x2
+
+def single_pass(model, input_tensor, guide_tensor, device, dataset_info, output_path):
+    with open(dataset_info, 'rb') as f:
+        values = pickle.load(f)
+
+    dataset_mean = values[0]
+    dataset_std = values[1]
+
+    model = model.to(device)
+    input_tensor = input_tensor.to(device)
+
+    result = model(input_tensor)
+
+    result = result.detach()
+    result = result.to(torch.device("cpu"))
+    result = unnormalize_tensor(result, dataset_mean, dataset_std)
+
+    result = result.detach().numpy()
+    result = result.squeeze(0)
+
+    guide_tensor = guide_tensor.detach().numpy()
+
+    if guide_tensor.shape[0] == 4:
+        guide_tensor = guide_tensor[:3, :, :]
+
+    if result[0].mean() > 1:
+        result /= 255
+
+    result = joint_bilateral_up_sample(result, guide_tensor, save_img=True, output_path=output_path)
+
+    return result
+
+# Returns an image's corresponding tensor
+def transform_single_png(sample):
+    img = img_transform(Image.open(sample))
+    dim = min(img.shape[1], img.shape[2])
+    square_transform = transforms.Compose([transforms.Resize((dim, dim))])
+    return square_transform(img)
+
+
+def scale_transform_sample(datapoint, standalone=False):
+    # Standalone is true if the function is called on a single image rather than as a part of a dataset
+    if standalone:
+        datapoint = datapoint.float() / 255
+
+    # Intial Size transform (256, 256) in order to save on processing, images get upscaled later
+    transform1 = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+    ])
+
+    # Removes alpha channel if image has one
+    if datapoint.shape[0] == 4:
+        datapoint = datapoint[:3, :, :]
+
+    # Size transform
+    datapoint = transform1(datapoint)
+
+    # Add batch dimension if single sample doesen't have it
+    if standalone and len(datapoint.shape) == 3:
+        datapoint = datapoint.unsqueeze(0)
+
+    return datapoint
+
+
+def normalize_sample(datapoint, mean, std):
+    normal_transform = transforms.Compose([
+        transforms.Normalize(mean=mean, std=std)
+    ])
+
+    return normal_transform(datapoint)
+
+
+def normalize_data(dataset):
+    mean = 0.0
+    std = 0.0
+
+    for datapoint in dataset:
+        datapoint[0] = datapoint[0].float() / 255
+        datapoint[1] = datapoint[1].float() / 255
+        mean += datapoint[0].mean() + datapoint[1].mean()
+        std += datapoint[0].std() + datapoint[1].std()
+
+    mean /= len(dataset) * 2
+    std /= len(dataset) * 2
+
+    normalized_dataset = []
+
+    for datapoint in dataset:
+        scaled_datapoints = [scale_transform_sample(datapoint[0]), scale_transform_sample(datapoint[1])]
+        normalized_dataset.append(
+            [normalize_sample(scaled_datapoints[0], mean, std), normalize_sample(scaled_datapoints[1], mean, std)])
+
+    return normalized_dataset, mean, std
+
+
+def unnormalize_tensor(sample, mean, std):
+    return sample * std + mean
+
+
+def joint_bilateral_up_sample(low_res, guide, d=5, sigma_color=0.1, sigma_space=2.0, save_img=False, output_path=""):
+    low_res = np.transpose(low_res, (1, 2, 0))
+    guide = np.transpose(guide, (1, 2, 0))
+    guide = np.float32(guide)
+
+    new_width = guide.shape[0]
+    new_height = guide.shape[1]
+
+    up_scaled_f = cv2.resize(low_res, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+    filtered_f = xip.jointBilateralFilter(guide, up_scaled_f, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    out = np.clip(filtered_f * 255.0, 0, 255).astype(np.uint8)
+
+    if save_img:
+        cv2.imwrite(output_path, out)
+
+    return out
+
+
 def create_image_from_ndarray(name, arr):
+
     if hasattr(arr, "cpu"):
         arr = arr.cpu().numpy()
 
+    #If we're dealing with a tensor with int type, convert it to float
     if arr.dtype != np.float32:
         arr = arr.astype(np.float32)
         arr /= 255.0
 
+    #If tensor is ordered in [channel, w, h], re-order to [w, h, channel]
     if arr.shape[0] == 4 or arr.shape[0] == 3:
         arr = np.transpose(arr, (1, 2, 0))
 
     height = arr.shape[0]
     width = arr.shape[1]
 
+    #Add alpha channel if missing one
     if arr.shape[2] == 3:
         arr = np.concatenate(
             [arr, np.ones((height, width, 1), dtype=arr.dtype)],
@@ -35,6 +237,7 @@ def create_image_from_ndarray(name, arr):
     # Create the new image data block
     image = bpy.data.images.new(name, width=width, height=height)
 
+    #Hook up image to image texture
     flat_data = arr.ravel()
     image.pixels = flat_data
 
@@ -46,7 +249,6 @@ def create_image_texture_node(node_tree, image, node_name="Generated Texture"):
     tex_node.label = node_name
     tex_node.image = image
     return tex_node
-
 
 # Optional: custom socket types, but you can also use built-in ones.
 class PBRGeneratorSocket(bpy.types.NodeSocket):
@@ -95,24 +297,30 @@ class PBRGeneratorNode(Node):
         return "PBR Generator"
 
     def process_image(self, diffuse_image):
-        albedo = transform_single_png(diffuse_image)
-        down_sample = scale_transform_sample(albedo, standalone=True)
+        albedo = transform_single_png(diffuse_image) #Create Albedo from input image
+        down_sample = scale_transform_sample(albedo, standalone=True) #Sample image down to 256x256 for feedforward
 
+        #Load Models
         AOGenerator = UNet(3)
         AOGenerator.load_state_dict(
             torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/AmbientOcclusion_SD.pt")))
+
         DisplacementGenerator = UNet(3)
         DisplacementGenerator.load_state_dict(
             torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/Displacement_SD.pt")))
+
         MetalnessGenerator = UNet(3)
         MetalnessGenerator.load_state_dict(
             torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/Metalness_SD.pt")))
+
         NormalGLGenerator = UNet(3)
         NormalGLGenerator.load_state_dict(torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/NormalGL_SD.pt")))
+
         RoughnessGenerator = UNet(3)
         RoughnessGenerator.load_state_dict(
             torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/Roughness_SD.pt")))
 
+        #Load Mean and STD information
         AODatasetInfo = ADDON_DIR + "/ModelInfo/AOTrainingDatasetInfo"
         DisplacementDatasetInfo = ADDON_DIR + "/ModelInfo/DisplacementTrainingDatasetInfo"
         NormalDatasetInfo = ADDON_DIR + "/ModelInfo/NormalGLTrainingDatasetInfo"
@@ -121,15 +329,20 @@ class PBRGeneratorNode(Node):
 
         device = "gpu" if torch.cuda.is_available() else "cpu"
 
+        #Feedforward
         albedo_data = albedo
         roughness_data = single_pass(RoughnessGenerator, down_sample, albedo, device, RoughnessDatasetInfo,
                                      output_path="Roughness.png")
+
         normal_data = single_pass(NormalGLGenerator, down_sample, albedo, device, NormalDatasetInfo,
                                   output_path="Normal.png")
+
         metallic_data = single_pass(MetalnessGenerator, down_sample, albedo, device, MetalnessDatasetInfo,
                                     output_path="Metallic.png")
+
         ambient_occlusion_data = single_pass(AOGenerator, down_sample, albedo, device, AODatasetInfo,
                                              output_path="AO.png")
+
         displacement_data = single_pass(DisplacementGenerator, down_sample, albedo, device, DisplacementDatasetInfo,
                                         output_path="Displacement.png")
 
@@ -164,9 +377,12 @@ class PBRGeneratorOperator(Operator):
             image_path)
 
         node_tree = context.space_data.edit_tree
+
+        #Create Image Texture Nodes
         albedo_node = create_image_texture_node(node_tree,
                                                 create_image_from_ndarray(f"{material_name} Albedo", albedo_data),
                                                 "Albedo Map")
+
         ao_node = create_image_texture_node(node_tree, create_image_from_ndarray(f"{material_name} AO", ao_data),
                                             "Generated Ambient Occlusion Map")
         normal_node = create_image_texture_node(node_tree,
@@ -182,7 +398,14 @@ class PBRGeneratorOperator(Operator):
                                                       create_image_from_ndarray(f"{material_name} Displacement",
                                                                                 displacement_data),
                                                       "Generated Displacement Map")
-        # 1) Find (or create) a Principled BSDF node in the current node tree
+        #Set color space for image textures
+        normal_node.image.colorspace_settings.is_data = True
+        metallic_node.image.colorspace_settings.is_data = True
+        roughness_node.image.colorspace_settings.is_data = True
+        ao_node.image.colorspace_settings.is_data = True
+        displacement_node.image.colorspace_settings.is_data = True
+
+        #Find or create bdsf node
         bsdf_node = None
         for n in node_tree.nodes:
             if n.type == 'BSDF_PRINCIPLED':
@@ -193,90 +416,52 @@ class PBRGeneratorOperator(Operator):
             bsdf_node = node_tree.nodes.new('ShaderNodeBsdfPrincipled')
             bsdf_node.location = (400, 0)
 
-        # 2) Create a Normal Map node for the normal texture
+        #Create normal map node
         normal_map_node = node_tree.nodes.new('ShaderNodeBump')
-        normal_map_node.location = (normal_node.location.x + 200, normal_node.location.y)
+        normal_map_node.inputs["Strength"].default_value = 0.2
+        normal_map_node.inputs["Distance"].default_value = 1.0
 
-        # 3) Set color space for non-color textures:
-        normal_node.image.colorspace_settings.is_data = True
-        metallic_node.image.colorspace_settings.is_data = True
-        roughness_node.image.colorspace_settings.is_data = True
-        ao_node.image.colorspace_settings.is_data = True
-        displacement_node.image.colorspace_settings.is_data = True
-
-        # 4) Connect the newly created Image Texture nodes to the BSDF:
-        links = node_tree.links
-
-        # Albedo -> Base Color
-        links.new(albedo_node.outputs["Color"], bsdf_node.inputs["Base Color"])
-
-        # Metallic -> Metallic
-        links.new(metallic_node.outputs["Color"], bsdf_node.inputs["Metallic"])
-
-        # Roughness -> Roughness
+        # Create roughness multiplier node
         roughness_math_node = node_tree.nodes.new("ShaderNodeMath")
         roughness_math_node.label = "Roughness Scale"
         roughness_math_node.operation = 'MULTIPLY'
         roughness_math_node.inputs[1].default_value = 2.0  # factor to multiply roughness by
-        roughness_math_node.location = (roughness_node.location.x + 200, roughness_node.location.y)
 
-
-        # Connect the texture to the math node
-        links.new(roughness_node.outputs["Color"], roughness_math_node.inputs[0])
-        # Connect the math node to the Principled BSDF
-        links.new(roughness_math_node.outputs["Value"], bsdf_node.inputs["Roughness"])
-
-        # Normal -> Normal Map node -> BSDF Normal
-        links.new(normal_node.outputs["Color"], normal_map_node.inputs["Height"])
-        links.new(normal_map_node.outputs["Normal"], bsdf_node.inputs["Normal"])
-        normal_map_node.inputs["Strength"].default_value = 0.2
-        normal_map_node.inputs["Distance"].default_value = 1.0
-
-        # AO multiply with Albedo
+        #Create Mix node for AO and Color
         mix_node = node_tree.nodes.new('ShaderNodeMixRGB')
         mix_node.blend_type = 'MULTIPLY'
         mix_node.inputs["Fac"].default_value = 1.0  # full effect
-        mix_node.location = (albedo_node.location.x + 200, albedo_node.location.y - 200)
-
-        links.new(albedo_node.outputs["Color"], mix_node.inputs["Color1"])
-        links.new(ao_node.outputs["Color"], mix_node.inputs["Color2"])
-        # Then connect that multiplied result to Base Color
-        links.new(mix_node.outputs["Color"], bsdf_node.inputs["Base Color"])
 
         # Create the Shader Displacement node
         disp_shader_node = node_tree.nodes.new('ShaderNodeDisplacement')
-
-        # Connect the displacement texture to the Displacement node
-        links.new(displacement_node.outputs["Color"], disp_shader_node.inputs["Height"])
-        # Optionally, you can set a midlevel or scale here:
         disp_shader_node.inputs["Scale"].default_value = 0.02
         disp_shader_node.inputs["Midlevel"].default_value = 0.50
 
-        # Optionally rename Displacement node label
-        disp_shader_node.label = "Displacement Node"
-
-        # 1) Create a Color Ramp (ValToRGB) node
+        #Create colormap node for displacement
         color_ramp_node = node_tree.nodes.new("ShaderNodeValToRGB")
         color_ramp_node.label = "Displacement Color Ramp"
-        color_ramp_node.location = (
-            displacement_node.location.x + 300,
-            displacement_node.location.y
-        )
 
-        # (Optional) Set up default ramp stops (black to white from 0 to 1)
-        cr_elements = color_ramp_node.color_ramp.elements
-        cr_elements[0].position = 0.0
-        cr_elements[0].color = (0.0, 0.0, 0.0, 1.0)  # black
-        cr_elements[1].position = 1.0
-        cr_elements[1].color = (1.0, 1.0, 1.0, 1.0)  # white
-
-        # 2) Connect the displacement texture's "Color" output to the ColorRamp's "Fac" input
+        #Connect texture nodes to bdsf
+        links = node_tree.links
+        # Albedo -> Base Color
+        links.new(albedo_node.outputs["Color"], bsdf_node.inputs["Base Color"])
+        # Metallic -> Metallic
+        links.new(metallic_node.outputs["Color"], bsdf_node.inputs["Metallic"])
+        # Roughness -> Multiplier -> Roughness
+        links.new(roughness_node.outputs["Color"], roughness_math_node.inputs[0])
+        links.new(roughness_math_node.outputs["Value"], bsdf_node.inputs["Roughness"])
+        # Normal -> Normal Map node -> BSDF Normal
+        links.new(normal_node.outputs["Color"], normal_map_node.inputs["Height"])
+        links.new(normal_map_node.outputs["Normal"], bsdf_node.inputs["Normal"])
+        # Albedo + AO -> Multiplier -> Color
+        links.new(albedo_node.outputs["Color"], mix_node.inputs["Color1"])
+        links.new(ao_node.outputs["Color"], mix_node.inputs["Color2"])
+        links.new(mix_node.outputs["Color"], bsdf_node.inputs["Base Color"])
+        # Displacement -> Color Ramp -> Displacement Node -> Displacement
         links.new(displacement_node.outputs["Color"], color_ramp_node.inputs["Fac"])
-
-        # 3) Connect the ColorRamp output to the Displacement node's "Height"
         links.new(color_ramp_node.outputs["Color"], disp_shader_node.inputs["Height"])
 
-        # 5) Arrange node locations so they don't overlap
+        #Arrange Nodes
         albedo_node.location = (-800, 200)
         ao_node.location = (-800, 0)
         metallic_node.location = (-800, -200)
@@ -285,11 +470,12 @@ class PBRGeneratorOperator(Operator):
         normal_node.location = (-800, -600)
         normal_map_node.location = (-500, -600)
         displacement_node.location = (-800, -800)
-        disp_shader_node.location = (-500, -800)
+        color_ramp_node.location = (-500, -800)
+        disp_shader_node.location = (-200, -800)
         mix_node.location = (-400, 80)
         bsdf_node.location = (0, 0)
 
-        # 6) Connect the BSDF to the Material Output node:
+        #BDSF -> Output
         output_node = None
         for n in node_tree.nodes:
             if n.type == 'OUTPUT_MATERIAL':
@@ -298,12 +484,12 @@ class PBRGeneratorOperator(Operator):
         if not output_node:
             output_node = node_tree.nodes.new('ShaderNodeOutputMaterial')
             output_node.location = (200, 0)
-
         links.new(bsdf_node.outputs["BSDF"], output_node.inputs["Surface"])
-        # -- Connect Displacement to the Material Output
+
+        #Displacement Node -> Displacement
         links.new(disp_shader_node.outputs["Displacement"], output_node.inputs["Displacement"])
 
-        mat = None
+        #Set Material to Displacement and Bump
         obj = context.view_layer.objects.active
         if obj and obj.active_material:
             mat = obj.active_material
@@ -319,7 +505,7 @@ class PBRGeneratorOperator(Operator):
         mapping_node.label = "Mapping"
         mapping_node.location = (-1000, 300)
 
-        # Hook up the TexCoord node to the Mapping node (using the "UV" output as an example)
+        # Hook up the TexCoord node to the Mapping node
         links.new(tex_coord_node.outputs["UV"], mapping_node.inputs["Vector"])
 
         # Now connect the Mapping output to each image texture node's 'Vector' input

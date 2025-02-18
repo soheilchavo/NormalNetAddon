@@ -355,6 +355,7 @@ class PBRGeneratorOperator(Operator):
         roughness_math_node.inputs[1].default_value = 2.0  # factor to multiply roughness by
         roughness_math_node.location = (roughness_node.location.x + 200, roughness_node.location.y)
 
+
         # Connect the texture to the math node
         links.new(roughness_node.outputs["Color"], roughness_math_node.inputs[0])
         # Connect the math node to the Principled BSDF
@@ -388,6 +389,27 @@ class PBRGeneratorOperator(Operator):
 
         # Optionally rename Displacement node label
         disp_shader_node.label = "Displacement Node"
+
+        # 1) Create a Color Ramp (ValToRGB) node
+        color_ramp_node = node_tree.nodes.new("ShaderNodeValToRGB")
+        color_ramp_node.label = "Displacement Color Ramp"
+        color_ramp_node.location = (
+            displacement_node.location.x + 300,
+            displacement_node.location.y
+        )
+
+        # (Optional) Set up default ramp stops (black to white from 0 to 1)
+        cr_elements = color_ramp_node.color_ramp.elements
+        cr_elements[0].position = 0.0
+        cr_elements[0].color = (0.0, 0.0, 0.0, 1.0)  # black
+        cr_elements[1].position = 1.0
+        cr_elements[1].color = (1.0, 1.0, 1.0, 1.0)  # white
+
+        # 2) Connect the displacement texture's "Color" output to the ColorRamp's "Fac" input
+        links.new(displacement_node.outputs["Color"], color_ramp_node.inputs["Fac"])
+
+        # 3) Connect the ColorRamp output to the Displacement node's "Height"
+        links.new(color_ramp_node.outputs["Color"], disp_shader_node.inputs["Height"])
 
         # 5) Arrange node locations so they don't overlap
         albedo_node.location = (-800, 200)

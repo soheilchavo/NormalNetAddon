@@ -45,6 +45,9 @@ def single_pass(model, input_tensor, guide_tensor, device, dataset_info, output_
     if guide_tensor.shape[0] == 4:
         guide_tensor = guide_tensor[:3, :, :]
 
+    if result[0].mean() > 1:
+        result /= 255
+        
     result = joint_bilateral_up_sample(result, guide_tensor, save_img=True, output_path=output_path)
 
     return result
@@ -232,18 +235,18 @@ class PBRGeneratorNode(Node):
 
         AOGenerator = UNet(3)
         AOGenerator.load_state_dict(
-            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/AmbientOcclusionGeneratorSD.pt")))
+            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/AmbientOcclusion_SD.pt")))
         DisplacementGenerator = UNet(3)
         DisplacementGenerator.load_state_dict(
-            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/DisplacementGeneratorSD.pt")))
+            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/Displacement_SD.pt")))
         MetalnessGenerator = UNet(3)
         MetalnessGenerator.load_state_dict(
-            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/MetalnessGeneratorSD.pt")))
+            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/Metalness_SD.pt")))
         NormalGLGenerator = UNet(3)
-        NormalGLGenerator.load_state_dict(torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/NormalGLGeneratorSD.pt")))
+        NormalGLGenerator.load_state_dict(torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/NormalGL_SD.pt")))
         RoughnessGenerator = UNet(3)
         RoughnessGenerator.load_state_dict(
-            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/RoughnessGeneratorSD.pt")))
+            torch.load(os.path.join(ADDON_DIR, "ModelsStateDict/Roughness_SD.pt")))
 
         AODatasetInfo = ADDON_DIR + "/ModelInfo/AOTrainingDatasetInfo"
         DisplacementDatasetInfo = ADDON_DIR + "/ModelInfo/DisplacementTrainingDatasetInfo"
@@ -326,7 +329,7 @@ class PBRGeneratorOperator(Operator):
             bsdf_node.location = (400, 0)
 
         # 2) Create a Normal Map node for the normal texture
-        normal_map_node = node_tree.nodes.new('ShaderNodeNormalMap')
+        normal_map_node = node_tree.nodes.new('ShaderNodeBump')
         normal_map_node.location = (normal_node.location.x + 200, normal_node.location.y)
 
         # 3) Set color space for non-color textures:
@@ -358,9 +361,10 @@ class PBRGeneratorOperator(Operator):
         links.new(roughness_math_node.outputs["Value"], bsdf_node.inputs["Roughness"])
 
         # Normal -> Normal Map node -> BSDF Normal
-        links.new(normal_node.outputs["Color"], normal_map_node.inputs["Color"])
+        links.new(normal_node.outputs["Color"], normal_map_node.inputs["Height"])
         links.new(normal_map_node.outputs["Normal"], bsdf_node.inputs["Normal"])
         normal_map_node.inputs["Strength"].default_value = 0.2
+        normal_map_node.inputs["Distance"].default_value = 1.0
 
         # AO multiply with Albedo
         mix_node = node_tree.nodes.new('ShaderNodeMixRGB')

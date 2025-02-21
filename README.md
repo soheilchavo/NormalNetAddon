@@ -9,9 +9,9 @@ an AI-generated PBR for you. The addon is still quite janky, so use with caution
 In order to run the addon, you must first install the following dependencies for Blender using the terminal:
 
 ```console
-cd <Your Blender Directory>/Contents/Resources/3.x/python/bin
-python3.x -m pip install opencv-python
-python3.x -m pip install torch
+cd <Your Blender Directory>/Contents/Resources/<Blender version>/python/bin/
+./python3.x -m pip install opencv-python
+./python3.x -m pip install torch
 ```
 
 ## 🛠️ Usage
